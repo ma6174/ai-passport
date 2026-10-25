@@ -1,4 +1,5 @@
 build/
+.cache/
 sdkconfig
 sdkconfig.old
 managed_components/
@@ -11,3 +12,6 @@ managed_components/
 /.agents/skills/passport-build
 /.agents/skills/passport-device-test
 /.agents/skills/passport-debug
+
+# 本地凭证,禁止提交
+main/local_secrets.h

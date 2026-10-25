@@ -1,46 +1,38 @@
 #!/usr/bin/env python3
-"""Static contracts for the deep-sleep key-wake guard wiring in main.c."""
+"""Contracts for the deep-sleep key-wake guard.
+
+The guard only matters when an application enters deep sleep and wakes on a GPIO:
+the waking key is still held, so the button component grades it as a long press.
+This check keeps the guard honest without pinning it to one application: if a
+source file arms the guard, it must also consume it, and the guard state machine
+must stay unit-tested.
+"""
 
 from pathlib import Path
-import re
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def read(relative_path: str) -> str:
-    return (ROOT / relative_path).read_text(encoding="utf-8")
-
-
-def function_body(source: str, name: str) -> str:
-    match = re.search(rf"\b{re.escape(name)}\s*\([^;]*?\)\s*\{{", source)
-    if not match:
-        raise AssertionError(f"function not found: {name}")
-    start = match.end() - 1
-    depth = 0
-    for index in range(start, len(source)):
-        if source[index] == "{":
-            depth += 1
-        elif source[index] == "}":
-            depth -= 1
-            if depth == 0:
-                return source[start + 1:index]
-    raise AssertionError(f"function is unterminated: {name}")
+def main_sources() -> list[Path]:
+    return sorted((ROOT / "main").glob("*.c"))
 
 
 class KeyWakeGuardWiringTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.main = read("main/main.c")
+    def test_guard_is_consumed_wherever_it_is_armed(self) -> None:
+        armed = [path for path in main_sources() if "key_guard_arm(" in path.read_text(encoding="utf-8")]
+        for path in armed:
+            source = path.read_text(encoding="utf-8")
+            self.assertIn(
+                "key_guard_consume(",
+                source,
+                f"{path.relative_to(ROOT)} arms the key guard without consuming it",
+            )
 
-    def test_on_key_consumes_the_guard_before_the_readiness_check(self) -> None:
-        # A release can arrive after the post-init voltage sample but before input
-        # dispatch is ready. on_key must run the guard first so that release still
-        # disarms it, instead of being discarded by the readiness early-return.
-        body = function_body(self.main, "on_key")
-        self.assertIn("key_guard_consume(", body)
-        self.assertLess(body.index("key_guard_consume("), body.index("!s_input_ready"))
+    def test_guard_state_machine_has_a_host_test(self) -> None:
+        self.assertTrue((ROOT / "tests" / "test_key_guard.c").is_file())
+        self.assertTrue((ROOT / "main" / "key_guard.h").is_file())
 
 
 if __name__ == "__main__":

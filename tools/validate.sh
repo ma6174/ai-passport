@@ -28,6 +28,12 @@ run_static_checks() {
         tests/test_ui_pixel_math.c main/ui_pixel_math.c \
         -o "${test_dir}/test_ui_pixel_math"
     "${test_dir}/test_ui_pixel_math"
+    for sonar in wav uri time decision policy geo; do
+        "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+            "tests/test_sonar_${sonar}.c" "main/sonar_${sonar}.c" \
+            -o "${test_dir}/test_sonar_${sonar}"
+        "${test_dir}/test_sonar_${sonar}"
+    done
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_demo_navigation.c main/demo_navigation.c \
         -o "${test_dir}/test_demo_navigation"
