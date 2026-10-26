@@ -20,6 +20,8 @@ idf_component_register(
          "sonar_session.c"
          "sonar_text.c"
          "sonar_opus.c"
+         "sonar_ogg.c"
+         "sonar_ogg_mux.c"
          "font_cjk16.c"
     INCLUDE_DIRS "."
     REQUIRES bsp bt esp_event esp_hw_support esp_netif esp_timer esp_wifi nvs_flash

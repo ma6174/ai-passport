@@ -11,6 +11,7 @@
 
 #include "app_ui.h"
 #include "audio_coordinator.h"
+#include "sonar_ogg.h"
 #include "bsp_audio.h"
 #include "bsp_battery.h"
 #include "bsp_button.h"
@@ -981,8 +982,38 @@ static bool session_turn(const char *transcript) {
                 if (derr == ESP_OK) {
                     ESP_LOGI(TAG, "turn 原声 %u 字节 post=%s kind=%s", (unsigned)len,
                              item->post_id, item->kind);
+                    // 服务端按存储格式原样返回:历史素材是 RIFF/WAV,手机新录的是
+                    // Ogg Opus。播放链路只认 16 kHz PCM,所以 Ogg 要先解码成 WAV。
+                    uint8_t magic[4] = {0};
+                    FILE *mf = fopen(SONAR_PLAY_PATH, "rb");
+                    if (mf != NULL) {
+                        if (fread(magic, 1, sizeof(magic), mf) != sizeof(magic)) {
+                            memset(magic, 0, sizeof(magic));
+                        }
+                        fclose(mf);
+                    }
+                    const char *play_path = SONAR_PLAY_PATH;
+                    if (memcmp(magic, "OggS", 4) == 0) {
+                        uint32_t pcm = 0;
+                        int64_t td = now_ms();
+                        esp_err_t oerr =
+                            sonar_ogg_decode_to_wav(SONAR_PLAY_PATH, SONAR_PLAY_PCM_PATH, &pcm);
+                        ESP_LOGI(TAG, "[t] Ogg 解码 %lld ms (%u 字节 PCM)",
+                                 (long long)(now_ms() - td), (unsigned)pcm);
+                        if (oerr != ESP_OK) {
+                            // 合同要求:不能把"解不了"当成播放成功,不发 played。
+                            set_detail("answer format unsupported");
+                            set_phase(APP_PHASE_IDLE, "answer format unsupported");
+                            goto turn_done;
+                        }
+                        play_path = SONAR_PLAY_PCM_PATH;
+                    } else if (memcmp(magic, "RIFF", 4) != 0) {
+                        set_detail("answer format unknown");
+                        set_phase(APP_PHASE_IDLE, "answer format unknown");
+                        goto turn_done;
+                    }
                     play_req_t req = {.is_mem = 0, .data = NULL, .len = 0};
-                    snprintf(req.path, sizeof(req.path), "%s", SONAR_PLAY_PATH);
+                    snprintf(req.path, sizeof(req.path), "%s", play_path);
                     snprintf(req.ctx_post_id, sizeof(req.ctx_post_id), "%s", item->post_id);
                     enqueue_play(&req);
                     set_phase(APP_PHASE_IDLE, "playing answer");
@@ -1022,6 +1053,7 @@ static bool session_turn(const char *transcript) {
     } else {
         set_detail("session %s", esp_err_to_name(err));
     }
+turn_done:
     API_UNLOCK();
     return err == ESP_OK;
 }

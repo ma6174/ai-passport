@@ -12,6 +12,7 @@
 
 #define SONAR_REC_PATH "/spiffs/rec.wav"
 #define SONAR_OPUS_PATH "/spiffs/rec.opus"  // 录音时同步生成的 Opus 裸包流
+#define SONAR_PLAY_PCM_PATH "/spiffs/play16k.wav"  // Ogg 原声解码后的 PCM
 #define SONAR_ASSISTANT_PATH "/spiffs/assistant.wav"  // 首次语音调用自带的助手回复
 #define SONAR_PLAY_PATH "/spiffs/play.wav"   // 收到/下载的真人原声
 #define SONAR_Q_PATH "/spiffs/q.wav"         // 邀请里附带的问题原声
