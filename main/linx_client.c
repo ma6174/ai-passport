@@ -387,6 +387,7 @@ static esp_err_t stream_pcm(const char *wav_path) {
     uint32_t left = info.data_bytes;
     uint32_t frames = 0;
     int64_t t_start = esp_timer_get_time();
+    int64_t paced_start = t_start;
     while (left > 0) {
         size_t want = left > sizeof(frame) ? sizeof(frame) : left;
         size_t n = fread(frame, 1, want, fp);
@@ -406,8 +407,16 @@ static esp_err_t stream_pcm(const char *wav_path) {
         // 必须按 20 ms 实时节奏发。实测(2026-10-26)全速灌入 2.5 秒语音只用 758 ms,
         // 服务端完全不给转写(三次都在 25 秒超时),说明它按实时流做 VAD/分段,
         // 突发数据会被丢掉。要省掉这段时间只能"边录边传",不能靠提速。
+        //
+        // 节奏按"绝对时间"算,不能每帧 vTaskDelay(20) 累加:LVGL 刷新、HTTP 轮询都会
+        // 让单次延时不小于 20 ms,累加后 1.96 秒的语音实测被拖到 3.8 秒,服务端
+        // 已经开始下一轮(tts stop 先到),转写就永远等不到。
         if (left > 0) {
-            vTaskDelay(pdMS_TO_TICKS(20));
+            int64_t due = paced_start + (int64_t)frames * 20 * 1000;
+            int64_t wait_ms = (due - esp_timer_get_time()) / 1000;
+            if (wait_ms > 0) {
+                vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms));
+            }
         }
     }
     fclose(fp);
