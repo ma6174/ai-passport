@@ -26,6 +26,10 @@ void linx_set_progress(void (*cb)(const char *msg));
 // 预连接:按下说话时后台开始 TLS 握手,把握手时间藏在说话时间里。
 void linx_prewarm(const sonar_config_t *cfg);
 
+// 取首次语音调用自带的助手回复(文本 + WAV)。返回 false 表示没有可用回复,
+// 调用方应退回"再建一次连"的老路径。
+bool linx_assistant_take(char *text, size_t text_len, uint32_t *pcm_bytes);
+
 const char *linx_device_id(void);
 
 // 走官方 OTA:未绑定返回激活码(供用户在灵矽智控台绑定),已绑定则把

@@ -940,16 +940,30 @@ static bool session_turn(const char *transcript) {
             s_clarify_pending = false;
             s_prev_utterance[0] = '\0';
             if (strcmp(turn.action, "private_chat") == 0) {
-                // 私人助手由灵矽负责:服务端对 private_chat 只回 outcome,不给文本/音频。
+                // 私人助手由灵矽负责:服务端对 private_chat 只回 outcome。
+                // 首次语音调用里平台已经顺手生成了一份助手回复(音频 + 文本),
+                // 正常情况下直接播它,不再建第二次连、不再重传同一段录音。
                 set_phase(APP_PHASE_THINK, "assistant");
                 char reply[128] = {0};
-                esp_err_t cerr = linx_chat(&s_cfg, SONAR_REC_PATH, SONAR_TTS_PATH, reply,
-                                           sizeof(reply), 12000);
+                uint32_t pcm = 0;
+                esp_err_t cerr = ESP_OK;
+                if (linx_assistant_take(reply, sizeof(reply), &pcm)) {
+                    play_req_t pr = {.is_mem = 0, .data = NULL, .len = 0};
+                    snprintf(pr.path, sizeof(pr.path), "%s", SONAR_ASSISTANT_PATH);
+                    enqueue_play(&pr);
+                } else {
+                    cerr = linx_chat(&s_cfg, SONAR_REC_PATH, SONAR_TTS_PATH, reply,
+                                     sizeof(reply), 12000);
+                }
                 if (cerr == ESP_OK) {
                     set_sticky("助手: %s", reply);
-                    play_req_t pr = {.is_mem = 0, .data = NULL, .len = 0};
-                    snprintf(pr.path, sizeof(pr.path), "%s", SONAR_TTS_PATH);
-                    enqueue_play(&pr);
+                    if (pcm > 0) {
+                        // 音频已在上面入队(复用的首轮回复),这里不再重复入队
+                    } else {
+                        play_req_t pr = {.is_mem = 0, .data = NULL, .len = 0};
+                        snprintf(pr.path, sizeof(pr.path), "%s", SONAR_TTS_PATH);
+                        enqueue_play(&pr);
+                    }
                 } else {
                     set_detail("assistant: no reply from linx");
                     sonar_store_remove(SONAR_TTS_PATH);

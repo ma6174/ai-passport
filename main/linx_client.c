@@ -50,6 +50,11 @@ static FILE *s_tts_fp;
 static uint32_t s_tts_bytes;
 static char *s_reply_text;
 static size_t s_reply_len;
+// 首次语音调用(STT)期间平台会顺手生成一份助手回复:音频走二进制帧、文本走
+// tts.sentence_start。这里把它收下来,私人聊天判定成立时直接播,省掉第二次
+// 建连 + 重传同一段录音。
+static SemaphoreHandle_t s_tts_mux;
+static char s_assistant_text[256];
 
 // OTA 响应只有几百字节;单独用小块,别和 Sonar 的 inbox 缓冲抢内部 RAM。
 static char s_resp_buf[4096];
@@ -166,13 +171,21 @@ static void on_ws_text(const char *data, size_t len) {
 }
 
 static void on_ws_bin(const uint8_t *data, size_t len) {
-    if (s_tts_fp == NULL || len == 0) {
+    if (len == 0) {
+        return;
+    }
+    if (s_tts_mux == NULL || xSemaphoreTake(s_tts_mux, pdMS_TO_TICKS(200)) != pdTRUE) {
+        return;
+    }
+    if (s_tts_fp == NULL) {
+        xSemaphoreGive(s_tts_mux);
         ESP_LOGI(TAG, "server binary: %u 字节(未在接收状态)", (unsigned)len);
         return;
     }
     // 下行音频按到达顺序追加;分片重组已由 linx_ws 完成,这里拿到的是整条消息。
     fwrite(data, 1, len, s_tts_fp);
     s_tts_bytes += (uint32_t)len;
+    xSemaphoreGive(s_tts_mux);
 }
 
 static void on_ws_close(void) {
@@ -390,10 +403,11 @@ static esp_err_t stream_pcm(const char *wav_path) {
         }
         left -= (uint32_t)n;
         ++frames;
-        // 录音已经结束,不必再按 20 ms 实时节奏发:服务端把收到的帧交给 ASR,
-        // 全速灌入能把"说完话到转写"的等待从(语音时长)压到(几十毫秒)。
+        // 必须按 20 ms 实时节奏发。实测(2026-10-26)全速灌入 2.5 秒语音只用 758 ms,
+        // 服务端完全不给转写(三次都在 25 秒超时),说明它按实时流做 VAD/分段,
+        // 突发数据会被丢掉。要省掉这段时间只能"边录边传",不能靠提速。
         if (left > 0) {
-            vTaskDelay(pdMS_TO_TICKS(1));
+            vTaskDelay(pdMS_TO_TICKS(20));
         }
     }
     fclose(fp);
@@ -487,6 +501,51 @@ esp_err_t linx_probe(const sonar_config_t *cfg) {
     return err;
 }
 
+// 开始接收助手回复音频(占位头先写好,收尾时回填真实长度)。
+static bool assistant_capture_open(void) {
+    if (s_tts_mux == NULL) {
+        s_tts_mux = xSemaphoreCreateMutex();
+        if (s_tts_mux == NULL) {
+            return false;
+        }
+    }
+    xSemaphoreTake(s_tts_mux, portMAX_DELAY);
+    if (s_tts_fp != NULL) {
+        fclose(s_tts_fp);
+        s_tts_fp = NULL;
+    }
+    s_tts_bytes = 0;
+    s_assistant_text[0] = '\0';
+    s_reply_text = s_assistant_text;
+    s_reply_len = sizeof(s_assistant_text);
+    s_tts_fp = fopen(SONAR_ASSISTANT_PATH, "wb");
+    bool ok = s_tts_fp != NULL;
+    if (ok) {
+        uint8_t header[SONAR_WAV_HEADER_BYTES] = {0};
+        fwrite(header, 1, sizeof(header), s_tts_fp);
+    }
+    xSemaphoreGive(s_tts_mux);
+    return ok;
+}
+
+static void assistant_capture_close(void) {
+    if (s_tts_mux == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_tts_mux, portMAX_DELAY);
+    if (s_tts_fp != NULL) {
+        uint8_t header[SONAR_WAV_HEADER_BYTES];
+        sonar_wav_header(header, s_tts_bytes);
+        fseek(s_tts_fp, 0, SEEK_SET);
+        fwrite(header, 1, sizeof(header), s_tts_fp);
+        fclose(s_tts_fp);
+        s_tts_fp = NULL;
+    }
+    s_reply_text = NULL;
+    s_reply_len = 0;
+    xSemaphoreGive(s_tts_mux);
+}
+
 static esp_err_t stt_once(const sonar_config_t *cfg, const char *wav_path, bool use_opus,
                           char *text, size_t text_len, uint32_t timeout_ms) {
     if (text == NULL || text_len == 0) {
@@ -505,9 +564,7 @@ static esp_err_t stt_once(const sonar_config_t *cfg, const char *wav_path, bool 
     }
     s_stt_text = text;
     s_stt_len = text_len;
-    s_tts_fp = NULL;  // 公开转写不接收 TTS
-    s_reply_text = NULL;
-    s_reply_len = 0;
+    assistant_capture_open();
     xEventGroupClearBits(s_events, BIT_STT | BIT_ERROR);
 
     err = begin_listen(use_opus);
@@ -547,6 +604,30 @@ static esp_err_t stt_once(const sonar_config_t *cfg, const char *wav_path, bool 
         ESP_LOGI(TAG, "STT: %s", text);
     }
     return err;
+}
+
+bool linx_assistant_take(char *text, size_t text_len, uint32_t *pcm_bytes) {
+    // 回复音频是异步流进来的:业务判定通常只要 1 秒左右,所以多半已经收完。
+    // 等一小会儿再收尾,避免刚播到一半就没数据。
+    EventBits_t bits = xEventGroupWaitBits(s_events, BIT_TTS_DONE, pdTRUE, pdTRUE,
+                                           pdMS_TO_TICKS(1500));
+    assistant_capture_close();
+    uint32_t bytes = s_tts_bytes > SONAR_WAV_HEADER_BYTES ? s_tts_bytes : 0;
+    if (pcm_bytes != NULL) {
+        *pcm_bytes = bytes;
+    }
+    if ((bits & BIT_TTS_DONE) == 0) {
+        ESP_LOGW(TAG, "助手回复未收完(1.5s 内无 tts stop),已收 %u 字节", (unsigned)bytes);
+    }
+    if (bytes < 8000) {   // 少于 0.25 秒的音频没有播放价值,按失败处理
+        return false;
+    }
+    if (text != NULL && text_len > 0) {
+        snprintf(text, text_len, "%s", s_assistant_text);
+    }
+    ESP_LOGI(TAG, "复用首轮助手回复: %u 字节 PCM, 文本 %u 字",
+             (unsigned)bytes, (unsigned)strlen(s_assistant_text));
+    return true;
 }
 
 esp_err_t linx_speech_to_text(const sonar_config_t *cfg, const char *wav_path, char *text,

@@ -315,6 +315,12 @@ static bool ws_append(const uint8_t *data, size_t len) {
     return true;
 }
 
+// 帧负载复用同一块静态缓冲:下行音频每秒十余条消息,若每条都 malloc/free,
+// 反复申请不同大小的块会把堆切成"可用 26 KB 但最大块只有 5 KB",
+// 随后 TLS 握手就再也找不到连续内存(实测表现为 STT 反复 ESP_FAIL)。
+#define WS_FRAME_BUF 4096
+static uint8_t s_frame_buf[WS_FRAME_BUF];
+
 static void rx_task(void *arg) {
     (void)arg;
     while (!s_ws.stop && s_ws.open) {
@@ -356,14 +362,22 @@ static void rx_task(void *arg) {
             break;
         }
         uint8_t *payload = NULL;
+        bool payload_on_heap = false;
         if (len > 0) {
-            payload = malloc((size_t)len);
+            if (len <= WS_FRAME_BUF) {
+                payload = s_frame_buf;
+            } else {
+                payload = malloc((size_t)len);
+                payload_on_heap = payload != NULL;
+            }
             if (payload == NULL) {
                 ESP_LOGW(TAG, "无内存读 %u 字节帧", (unsigned)len);
                 break;
             }
             if (ws_tls_read_exact(payload, (size_t)len, 10000) != 0) {
-                free(payload);
+                if (payload_on_heap) {
+                    free(payload);
+                }
                 break;
             }
             if (masked) {
@@ -375,14 +389,20 @@ static void rx_task(void *arg) {
 
         if (opcode == 0x8) {  // close
             ESP_LOGI(TAG, "服务端关闭连接");
-            free(payload);
+            if (payload_on_heap) {
+                free(payload);
+            }
             break;
         } else if (opcode == 0x9) {  // ping -> pong
             ws_send_pong(payload, (size_t)len);
-            free(payload);
+            if (payload_on_heap) {
+                free(payload);
+            }
             continue;
         } else if (opcode == 0xA) {  // pong
-            free(payload);
+            if (payload_on_heap) {
+                free(payload);
+            }
             continue;
         } else if (opcode == 0x1) {  // 文本:重组后交给上层解析
             s_ws.msg_opcode = 0x01;
@@ -404,6 +424,12 @@ static void rx_task(void *arg) {
             } else if (s_ws.cb.on_bin != NULL && len > 0) {
                 s_ws.cb.on_bin(payload, (size_t)len);
             }
+        }
+        // 文本/二进制/续片三条路径都必须还回缓冲:回调是同步的,返回后负载即失效。
+        // 早期版本只在这三条以外 free,等于每收一条消息漏一块,mbedtls 走几十条
+        // 音频消息后堆就被啃掉几十 KB,下一次 STT 握手表现为 ESP_FAIL。
+        if (payload_on_heap) {
+            free(payload);
         }
     }
 
