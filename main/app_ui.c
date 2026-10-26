@@ -128,7 +128,7 @@ void app_ui_update(const app_view_t *view) {
     char buf[96];
     char place[96];
     char net[96];
-    char recent[128];
+    char recent[168];
     snprintf(place, sizeof(place), "PLACE %s", view->place);
     // 14 px 下 212 px 只放得下约 30 个字符,用缩写而不是让 DOT 截断。
     snprintf(net, sizeof(net), "W:%s  S:%s  L:%s  %d%%", view->wifi_ok ? "OK" : "--",

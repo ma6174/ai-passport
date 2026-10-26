@@ -145,13 +145,16 @@ esp_err_t sonar_config_seed(sonar_config_t *cfg) {
         changed = true;
     }
 #ifdef SONAR_SEED_WIFI_SSID
-    if (cfg->wifi_ssid[0] == '\0') {
+    // SSID 也跟随编译期配置:换网络时刷固件即生效(密码同理,见下)。
+    if (strcmp(cfg->wifi_ssid, SONAR_SEED_WIFI_SSID) != 0) {
+        ESP_LOGW(TAG, "Wi-Fi 改用编译期配置: %s", SONAR_SEED_WIFI_SSID);
         snprintf(cfg->wifi_ssid, sizeof(cfg->wifi_ssid), "%s", SONAR_SEED_WIFI_SSID);
         changed = true;
     }
 #endif
 #ifdef SONAR_SEED_WIFI_PASS
-    if (cfg->wifi_pass[0] == '\0') {
+    // Wi-Fi 密码同样跟随编译期配置:换了网络刷固件就该生效,不能被 NVS 里的旧值挡住。
+    if (strcmp(cfg->wifi_pass, SONAR_SEED_WIFI_PASS) != 0) {
         snprintf(cfg->wifi_pass, sizeof(cfg->wifi_pass), "%s", SONAR_SEED_WIFI_PASS);
         changed = true;
     }

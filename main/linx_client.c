@@ -203,7 +203,45 @@ static void ws_teardown(void) {
     }
 }
 
+static esp_err_t ws_connect(const sonar_config_t *cfg, uint32_t timeout_ms);
+
 static void (*s_progress)(const char *msg);
+static const sonar_config_t *s_cfg_ref;
+static TaskHandle_t s_prewarm_task;
+
+static void prewarm_task(void *arg) {
+    (void)arg;
+    // 必须和 STT/probe/OTA 共用同一把锁:s_ws 是全局单例,两个任务同时握手会
+    // 互相踩掉 mbedtls 上下文,表现为 Instruction access fault(MEPC=0)。
+    if (s_lock != NULL && xSemaphoreTake(s_lock, pdMS_TO_TICKS(15000)) != pdTRUE) {
+        ESP_LOGW(TAG, "预连接放弃:拿不到语音锁");
+        s_prewarm_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    if (s_cfg_ref != NULL && !linx_ws_is_open()) {
+        esp_err_t err = ws_connect(s_cfg_ref, 6000);
+        ESP_LOGI(TAG, "预连接%s: %s", err == ESP_OK ? "成功" : "失败", esp_err_to_name(err));
+    }
+    if (s_lock != NULL) {
+        xSemaphoreGive(s_lock);
+    }
+    s_prewarm_task = NULL;
+    vTaskDelete(NULL);
+}
+
+// 按下说话时调用:后台并行握手,松手后的转写就不用再等 TLS。
+void linx_prewarm(const sonar_config_t *cfg) {
+    s_cfg_ref = cfg;
+    if (cfg == NULL || linx_ws_is_open() || s_prewarm_task != NULL) {
+        return;
+    }
+    // 栈必须够大:TLS 握手会在**这个任务**里做 RSA 验证(mbedtls_mpi_exp_mod),
+    // 4096 字节会栈溢出成 "Load access fault"(实测崩在 mbedtls_mpi_cmp_mpi)。
+    if (xTaskCreate(prewarm_task, "linx_pre", 10240, NULL, 4, &s_prewarm_task) != pdPASS) {
+        s_prewarm_task = NULL;
+    }
+}
 
 void linx_set_progress(void (*cb)(const char *msg)) {
     s_progress = cb;
@@ -247,7 +285,7 @@ static esp_err_t ws_connect(const sonar_config_t *cfg, uint32_t timeout_ms) {
     // 都是瞬时的,退避重试 3 次再判定失败,别一次就报 ESP_FAIL 给用户。
     esp_err_t err = ESP_FAIL;
     for (int attempt = 0; attempt < 3; attempt++) {
-        err = linx_ws_open(uri, headers, &WS_CALLBACKS, 8000);
+        err = linx_ws_open(uri, headers, &WS_CALLBACKS, 4000);
         if (err == ESP_OK) {
             break;
         }
@@ -265,7 +303,7 @@ static esp_err_t ws_connect(const sonar_config_t *cfg, uint32_t timeout_ms) {
         // "证书校验"这种底层问题把整条语音链路卡死。
         ESP_LOGW(TAG, "严格校验握手失败,降级一次(不校验证书)重试");
         linx_ws_set_verify_relaxed(true);
-        err = linx_ws_open(uri, headers, &WS_CALLBACKS, 8000);
+        err = linx_ws_open(uri, headers, &WS_CALLBACKS, 4000);
         linx_ws_set_verify_relaxed(false);
         if (err != ESP_OK) {
             ws_teardown();
@@ -395,8 +433,8 @@ esp_err_t linx_probe(const sonar_config_t *cfg) {
     return err;
 }
 
-esp_err_t linx_speech_to_text(const sonar_config_t *cfg, const char *wav_path, char *text,
-                              size_t text_len, uint32_t timeout_ms) {
+static esp_err_t stt_once(const sonar_config_t *cfg, const char *wav_path, char *text,
+                          size_t text_len, uint32_t timeout_ms) {
     if (text == NULL || text_len == 0) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -436,12 +474,31 @@ esp_err_t linx_speech_to_text(const sonar_config_t *cfg, const char *wav_path, c
         }
     }
     s_stt_text = NULL;
-    ws_teardown();
+    if (err != ESP_OK) {
+        ws_teardown();
+    } else {
+        // 成功就留着连接:下次按句话不必再握手(C3 上握手要 ~5KB 连续内存,
+        // 一旦堆被 HTTP 轮询切碎就会以"证书不可信"的形式失败)。
+        ESP_LOGI(TAG, "保留 WSS 连接复用 free=%u largest=%u", (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    }
     if (s_lock != NULL) {
         xSemaphoreGive(s_lock);
     }
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "STT: %s", text);
+    }
+    return err;
+}
+
+esp_err_t linx_speech_to_text(const sonar_config_t *cfg, const char *wav_path, char *text,
+                              size_t text_len, uint32_t timeout_ms) {
+    // 录音文件还在 SPIFFS 上,失败重发一次几乎不花成本;用户层面少一次"说完没反应"。
+    esp_err_t err = stt_once(cfg, wav_path, text, text_len, timeout_ms);
+    if (err != ESP_OK || text[0] == '\0') {
+        ESP_LOGW(TAG, "转写第一次失败(%s),重试一次", esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(300));
+        err = stt_once(cfg, wav_path, text, text_len, timeout_ms);
     }
     return err;
 }

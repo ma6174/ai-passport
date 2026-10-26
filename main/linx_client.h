@@ -23,6 +23,9 @@ esp_err_t linx_client_init(void);
 // 语音链路进度(连接/重试)回报给界面,避免用户只看到静止的 transcribing。
 void linx_set_progress(void (*cb)(const char *msg));
 
+// 预连接:按下说话时后台开始 TLS 握手,把握手时间藏在说话时间里。
+void linx_prewarm(const sonar_config_t *cfg);
+
 const char *linx_device_id(void);
 
 // 走官方 OTA:未绑定返回激活码(供用户在灵矽智控台绑定),已绑定则把

@@ -27,7 +27,7 @@ typedef struct {
     char line1[40];  // 阶段标题(ASCII,避免缺字)
     char line2[64];  // 当前动作/提示
     char place[40];  // 演示地点
-    char detail[64]; // 最近事件
+    char detail[160]; // 最近事件(常驻显示,按字符截断)
     bool quiet;
     bool sonar_ok;
     bool linx_ok;

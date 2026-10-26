@@ -39,7 +39,7 @@ static const char *TAG = "linx_ws";
 // 文本消息(JSON)的重组上限。下行音频不走这里:它是持续流,边收边交给上层写文件,
 // 缓存整条消息会在 STT 会话里把堆吃穿(实测只剩 5.8 KB,后续音频帧写不出去)。
 #define WS_MAX_MESSAGE (8 * 1024)
-#define WS_RX_STACK 4096
+#define WS_RX_STACK 6144
 #define WS_POLL_MS 100
 
 typedef struct {
@@ -64,6 +64,16 @@ typedef struct {
 } linx_ws_t;
 
 static linx_ws_t s_ws = {.fd = -1};
+
+// 单例保护:s_ws(含 mbedtls 上下文)是全局唯一的一份。两个任务同时 open/close 会
+// 互相踩掉上下文,表现为 "Instruction access fault, MEPC=0"(实测崩在
+// ssl_prepare_record_content)。互斥不能只靠信号量——持锁任务被强制删除时会死锁,
+// 这里用一个原子标志做"进入即退出"的保护。
+static volatile bool s_busy;
+
+static esp_err_t open_locked(const char *url, const char *headers, const linx_ws_callbacks_t *cb,
+                             uint32_t timeout_ms);
+static void close_locked(void);
 
 // 诊断回调:打印对端证书链与逐张校验位,定位"证书不可信"卡在哪一环。
 static int verify_log(void *ctx, mbedtls_x509_crt *crt, int depth, uint32_t *flags) {
@@ -508,10 +518,21 @@ void linx_ws_set_verify_relaxed(bool relaxed) {
 
 esp_err_t linx_ws_open(const char *url, const char *headers, const linx_ws_callbacks_t *cb,
                        uint32_t timeout_ms) {
+    if (__atomic_exchange_n(&s_busy, true, __ATOMIC_ACQ_REL)) {
+        ESP_LOGW(TAG, "已有任务在使用连接,拒绝并发 open");
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t open_rc = open_locked(url, headers, cb, timeout_ms);
+    __atomic_store_n(&s_busy, false, __ATOMIC_RELEASE);
+    return open_rc;
+}
+
+static esp_err_t open_locked(const char *url, const char *headers, const linx_ws_callbacks_t *cb,
+                             uint32_t timeout_ms) {
     if (url == NULL || cb == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    linx_ws_close();
+    close_locked();
 
     char host[96];
     int port = 443;
@@ -528,6 +549,12 @@ esp_err_t linx_ws_open(const char *url, const char *headers, const linx_ws_callb
     if (getaddrinfo(host, port_str, &hints, &res) != 0 || res == NULL) {
         ESP_LOGE(TAG, "DNS 解析 %s 失败", host);
         return ESP_ERR_NOT_FOUND;
+    }
+    {
+        char ip[16] = {0};
+        struct sockaddr_in *a = (struct sockaddr_in *)res->ai_addr;
+        snprintf(ip, sizeof(ip), "%s", inet_ntoa(a->sin_addr));
+        ESP_LOGI(TAG, "连接 %s:%d (%s)", host, port, ip);
     }
     int fd = socket(res->ai_family, res->ai_socktype, 0);
     if (fd < 0) {
@@ -549,7 +576,7 @@ esp_err_t linx_ws_open(const char *url, const char *headers, const linx_ws_callb
 
     if (s_ws.inited || s_ws.fd >= 0) {
         ESP_LOGW(TAG, "上次会话未关闭,先释放再重连");
-        linx_ws_close();
+        close_locked();
     }
     memset(&s_ws.ssl, 0, sizeof(s_ws.ssl));
     memset(&s_ws.conf, 0, sizeof(s_ws.conf));
@@ -691,6 +718,15 @@ bool linx_ws_is_open(void) {
 }
 
 void linx_ws_close(void) {
+    if (__atomic_exchange_n(&s_busy, true, __ATOMIC_ACQ_REL)) {
+        ESP_LOGW(TAG, "已有任务在使用连接,本次 close 跳过");
+        return;
+    }
+    close_locked();
+    __atomic_store_n(&s_busy, false, __ATOMIC_RELEASE);
+}
+
+static void close_locked(void) {
     if (s_ws.rx_task != NULL) {
         s_ws.stop = true;
         // 等接收任务自己退出,避免它随后访问已释放的 TLS 上下文。

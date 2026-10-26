@@ -20,6 +20,7 @@
 #endif
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include <time.h>
 
 #include "nvs.h"
@@ -30,6 +31,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "linx_client.h"
+#include "linx_ws.h"
 #include "sonar_client.h"
 #include "sonar_config.h"
 #include "sonar_decision.h"
@@ -75,6 +77,7 @@ typedef struct {
     uint8_t is_mem;
     const uint8_t *data;
     size_t len;
+    int64_t queued_ms;      // 入队时刻:用于日志区分"排队久"和"播放久"
     char path[48];
     char ack_event[12];
     char delivery_id[SONAR_ID_MAX];
@@ -91,6 +94,8 @@ static SemaphoreHandle_t s_api_lock;
 static SemaphoreHandle_t s_inv_lock;
 
 static sonar_config_t s_cfg;
+// 启动时抓到的复位原因,留到网络就绪时再打一次(开机瞬间日志容易被串口吞掉)
+static esp_reset_reason_t s_reset_reason;
 static sonar_client_t s_client;
 static const sonar_place_preset_t *s_presets;
 static size_t s_preset_count;
@@ -104,6 +109,10 @@ static char s_last_question[SONAR_ID_MAX];
 static app_phase_t s_phase = APP_PHASE_BOOT;
 static char s_action[64] = "boot";
 static char s_detail[64];
+// 用户需要反复看的信息(转写、反问、回答人、播放结果)单独存一份:
+// 周期性状态(loc/inbox/question)不能把它冲掉,否则看一眼屏幕就忘了刚才说了什么。
+static char s_detail_sticky[160];
+static bool s_sticky;
 static char s_activation[16];
 static bool s_quiet;
 static bool s_sonar_ok;
@@ -145,6 +154,38 @@ static void set_detail(const char *fmt, ...) {
     vsnprintf(s_detail, sizeof(s_detail), fmt, args);
     va_end(args);
     ESP_LOGI(TAG, "%s", s_detail);
+}
+
+// 按"字符"截断 UTF-8:%.*s 是按字节截的,中文会被切半个字符显示成尖括号问号。
+static size_t utf8_prefix_len(const char *text, size_t max_chars) {
+    size_t chars = 0;
+    const char *p = text;
+    while (*p != '\0' && chars < max_chars) {
+        unsigned char c = (unsigned char)*p;
+        size_t step = (c < 0x80) ? 1 : ((c >> 5) == 0x06) ? 2 : ((c >> 4) == 0x0E) ? 3 : 4;
+        for (size_t i = 1; i < step && p[i] != '\0'; i++) {
+        }
+        p += step;
+        chars++;
+    }
+    return (size_t)(p - text);
+}
+
+// 常驻显示:直到下一轮开口才被替换。
+static void set_sticky(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(s_detail_sticky, sizeof(s_detail_sticky), fmt, args);
+    va_end(args);
+    // 版面宽 212 px、16 px 字号 ≈ 13 字/行 × 4 行,留一点余量按 40 字符截。
+    size_t keep = utf8_prefix_len(s_detail_sticky, 40);
+    s_detail_sticky[keep] = '\0';
+    s_sticky = true;
+    ESP_LOGI(TAG, "%s", s_detail_sticky);
+}
+
+static const char *current_detail(void) {
+    return s_sticky ? s_detail_sticky : s_detail;
 }
 
 static const char *phase_title(app_phase_t phase) {
@@ -196,7 +237,7 @@ static void refresh_view(void) {
     snprintf(view.line1, sizeof(view.line1), "%s", phase_title(s_phase));
     snprintf(view.line2, sizeof(view.line2), "%s", s_action);
     snprintf(view.place, sizeof(view.place), "%s", place_label_ascii(s_cfg.place_idx));
-    snprintf(view.detail, sizeof(view.detail), "%s", s_detail);
+    snprintf(view.detail, sizeof(view.detail), "%s", current_detail());
     if (!s_linx_bound && s_activation[0] != '\0') {
         snprintf(view.line2, sizeof(view.line2), "BIND CODE %s", s_activation);
     }
@@ -252,10 +293,12 @@ static void finish_current(bool completed, bool interrupted) {
     }
 }
 
-static esp_err_t enqueue_play(const play_req_t *req) {
+// 统一入队口:盖入队时间戳,方便日志区分"排队久"和"播放久"。
+static esp_err_t enqueue_play(play_req_t *req) {
     if (s_play_q == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
+    req->queued_ms = now_ms();
     return xQueueSend(s_play_q, req, pdMS_TO_TICKS(200)) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
@@ -317,6 +360,9 @@ static void start_next_playback(void) {
         sonar_journal_mark_attempted(req.delivery_id);
     }
     esp_err_t err = req.is_mem ? audio_play_mem(req.data, req.len) : audio_play_file(req.path);
+    if (req.queued_ms > 0) {
+        ESP_LOGI(TAG, "[t] 入队→开播 %lld ms", (long long)(now_ms() - req.queued_ms));
+    }
     ESP_LOGI(TAG, "开始播放 %s -> %s", req.is_mem ? "内存素材" : req.path,
              esp_err_to_name(err));
     if (err != ESP_OK) {
@@ -533,6 +579,12 @@ static void lock_invitation(const sonar_delivery_t *delivery) {
 
 static void poll_inbox_locked(void) {
     size_t count = 0;
+    // 语音连接常驻会占着 ~15KB;若轮到 HTTP 时内存不够,先把语音连接让出来再试一次。
+    if (linx_ws_is_open() && esp_get_free_heap_size() < 24000) {
+        ESP_LOGW(TAG, "内存紧张,先释放常驻语音连接 (heap=%u)",
+                 (unsigned)esp_get_free_heap_size());
+        linx_ws_close();
+    }
     // 有会话就取会话收件箱:它包含真人回答与配对闲聊(chat),也可按 chatd 前缀给 ID。
     esp_err_t err = sonar_session_inbox(&s_client, s_inbox, SONAR_MAX_DELIVERIES, &count);
     if (err != ESP_OK) {
@@ -600,7 +652,7 @@ static void poll_inbox_locked(void) {
             snprintf(req.delivery_id, sizeof(req.delivery_id), "%s", item->id);
             snprintf(req.request_id, sizeof(req.request_id), "%s", item->request_id);
             snprintf(req.ctx_post_id, sizeof(req.ctx_post_id), "%s", item->post_id);
-            xQueueSend(s_play_q, &req, pdMS_TO_TICKS(500));
+            enqueue_play(&req);
             return;  // 一次只处理一条
         }
     }
@@ -657,6 +709,8 @@ static void net_task(void *arg) {
                     s_quiet = s_client.quiet;
                     set_phase(APP_PHASE_IDLE, "online");
                     set_detail("sonar online, heap %u", (unsigned)esp_get_free_heap_size());
+                    ESP_LOGI(TAG, "sonar online heap=%u 复位原因=%d",
+                             (unsigned)esp_get_free_heap_size(), (int)s_reset_reason);
                 } else {
                     next_me = now + 5000;
                 }
@@ -859,14 +913,19 @@ static bool session_turn(const char *transcript) {
         utterance = merged;
         ESP_LOGI(TAG, "补上被反问前的原话: %s", merged);
     }
+    int64_t t0 = now_ms();
     API_LOCK();
     esp_err_t err = sonar_session_ensure(&s_client, &s_cfg, place);
+    int64_t t1 = now_ms();
     if (err == ESP_OK) {
         sonar_turn_t turn;
         err = sonar_session_utterance(&s_client, SONAR_REC_PATH,
                                       (size_t)sonar_store_file_size(SONAR_REC_PATH), utterance,
                                       &turn);
+        int64_t t2 = now_ms();
         if (err == ESP_OK) {
+            ESP_LOGI(TAG, "[t] 会话 %lld ms, utterance %lld ms", (long long)(t1 - t0),
+                     (long long)(t2 - t1));
             ESP_LOGI(TAG,
                      "turn %s status=%s action=%s reason=%s task=%s chat=%s conv=%s items=%u",
                      turn.turn_id, turn.status, turn.action, turn.reason, turn.task_id,
@@ -880,10 +939,10 @@ static bool session_turn(const char *transcript) {
                 esp_err_t cerr = linx_chat(&s_cfg, SONAR_REC_PATH, SONAR_TTS_PATH, reply,
                                            sizeof(reply), 12000);
                 if (cerr == ESP_OK) {
-                    set_detail("assistant: %s", reply);
+                    set_sticky("助手: %s", reply);
                     play_req_t pr = {.is_mem = 0, .data = NULL, .len = 0};
                     snprintf(pr.path, sizeof(pr.path), "%s", SONAR_TTS_PATH);
-                    xQueueSend(s_play_q, &pr, pdMS_TO_TICKS(500));
+                    enqueue_play(&pr);
                 } else {
                     set_detail("assistant: no reply from linx");
                     sonar_store_remove(SONAR_TTS_PATH);
@@ -893,15 +952,18 @@ static bool session_turn(const char *transcript) {
                 // 结构化动作优先:有音频就先放音频,agent 文本只当备注。
                 sonar_voice_item_t *item = &turn.items[0];
                 size_t len = 0;
+                int64_t t3 = now_ms();
                 esp_err_t derr =
                     sonar_session_download(&s_client, item->audio_url, SONAR_PLAY_PATH, &len);
+                ESP_LOGI(TAG, "[t] 原声下载 %lld ms (%u 字节)", (long long)(now_ms() - t3),
+                         (unsigned)len);
                 if (derr == ESP_OK) {
                     ESP_LOGI(TAG, "turn 原声 %u 字节 post=%s kind=%s", (unsigned)len,
                              item->post_id, item->kind);
                     play_req_t req = {.is_mem = 0, .data = NULL, .len = 0};
                     snprintf(req.path, sizeof(req.path), "%s", SONAR_PLAY_PATH);
                     snprintf(req.ctx_post_id, sizeof(req.ctx_post_id), "%s", item->post_id);
-                    xQueueSend(s_play_q, &req, pdMS_TO_TICKS(500));
+                    enqueue_play(&req);
                     set_phase(APP_PHASE_IDLE, "playing answer");
                 } else {
                     set_detail("turn audio failed %s", esp_err_to_name(derr));
@@ -911,11 +973,15 @@ static bool session_turn(const char *transcript) {
                 snprintf(s_prev_utterance, sizeof(s_prev_utterance), "%.*s",
                          (int)(sizeof(s_prev_utterance) - 1), utterance);
                 s_clarify_pending = true;
-                set_detail("ask again: %s", turn.agent_text);
+                set_sticky("问: %s", turn.agent_text);
                 // 必须回到可按键状态:停在 THINK 会让 OK 被 busy 判定吞掉。
                 set_phase(APP_PHASE_IDLE, "answer the question");
             } else {
-                set_detail("turn %s %s", turn.status, turn.reason);
+                if (strcmp(turn.status, "published") == 0) {
+                    set_sticky("已发布,等真人回答");
+                } else {
+                    set_detail("turn %s %s", turn.status, turn.reason);
+                }
                 set_phase(APP_PHASE_IDLE, strcmp(turn.status, "published") == 0
                                               ? "published, waiting voice"
                                               : "waiting voice");
@@ -991,6 +1057,7 @@ static void stop_recording_and_process(void) {
         ESP_LOGI(TAG, "录音 %u 字节%s, 峰值 %d", (unsigned)pcm_bytes,
                  truncated ? "(已截断)" : "", peak);
     }
+    int64_t t_rec_stop = now_ms();
     set_phase(APP_PHASE_THINK, "transcribing");
     // TLS 握手要一块 5 KB 以上的连续内存,这里把可用堆和最大连续块记下来,
     // 握手失败时就能立刻判断是"内存不够"还是"证书/协议"问题。
@@ -1003,14 +1070,17 @@ static void stop_recording_and_process(void) {
         ESP_LOGW(TAG, "STT 未给出文本: err=%s, buf=\"%s\"", esp_err_to_name(err),
                  s_transcript);
         set_phase(APP_PHASE_IDLE, "no transcript (voice kept)");
-        set_detail("stt %s", esp_err_to_name(err));
+        set_sticky("识别失败 %s", esp_err_to_name(err));
         return;
     }
+    int64_t t_stt = now_ms();
     ESP_LOGI(TAG, "转写: %s", s_transcript);
-    set_detail("transcript %u bytes", (unsigned)strlen(s_transcript));
+    set_sticky("我说: %s", s_transcript);
     // 多轮会话优先:一句话 = 一个 utterance,由服务端决定私聊回答、发布提问还是配对闲聊。
     // 会话不可用(没地点/未建会话/传输失败)时才回退到单轮的 drafts/confirm 流程。
     if (session_turn(s_transcript)) {
+        ESP_LOGI(TAG, "[t] 录音结束→转写 %lld ms, 转写→服务端结果 %lld ms", (long long)(t_stt - t_rec_stop),
+                 (long long)(now_ms() - t_stt));
         key_event_t stale2;
         while (xQueueReceive(s_keys, &stale2, 0) == pdTRUE) {
         }
@@ -1042,7 +1112,9 @@ static void begin_ptt(void) {
     log_heap("before record");
     if (audio_record_start(SONAR_REC_PATH) == ESP_OK) {
         s_ptt = true;
+        s_sticky = false;   // 新的一轮开始,清掉上一轮常驻信息
         set_phase(APP_PHASE_RECORD, "release to send");
+        linx_prewarm(&s_cfg);   // 边说边握手,松手后直接发音频
         set_detail("recording (8s max)");
     } else {
         set_phase(APP_PHASE_ERROR, "mic busy");
@@ -1192,6 +1264,26 @@ static void app_task(void *arg) {
     s_presets = sonar_place_presets(&s_preset_count);
 
     app_ui_init();  // 先建状态页:没配置时也要有黑底画面,而不是面板白底
+    // 弄清"它为什么重启":掉电/看门狗/panic 的处理方式完全不同。
+    {
+        esp_reset_reason_t rr = esp_reset_reason();
+        const char *name = "unknown";
+        switch (rr) {
+        case ESP_RST_POWERON: name = "poweron"; break;
+        case ESP_RST_EXT: name = "external"; break;
+        case ESP_RST_SW: name = "software"; break;
+        case ESP_RST_PANIC: name = "panic"; break;
+        case ESP_RST_INT_WDT: name = "int_wdt"; break;
+        case ESP_RST_TASK_WDT: name = "task_wdt"; break;
+        case ESP_RST_WDT: name = "wdt"; break;
+        case ESP_RST_BROWNOUT: name = "brownout"; break;
+        case ESP_RST_SDIO: name = "sdio"; break;
+        case ESP_RST_DEEPSLEEP: name = "deepsleep"; break;
+        default: break;
+        }
+        s_reset_reason = rr;
+        ESP_LOGW(TAG, "复位原因: %s(%d)", name, (int)rr);
+    }
     if (sonar_config_load(&s_cfg) != ESP_OK) {
         set_phase(APP_PHASE_ERROR, "config read failed");
     }
