@@ -585,6 +585,44 @@ static void lock_invitation(const sonar_delivery_t *delivery) {
     set_phase(APP_PHASE_IDLE, "hold OK to answer");
 }
 
+// 服务端按存储格式原样返回原声:历史素材 RIFF/WAV,手机新录的是 Ogg Opus。
+// 播放链路只认 16 kHz PCM,所以下载完必须先按首部分流——两条路径(本轮即时
+// 返回、收件箱异步投递)共用这里,不能只照顾其中一条。
+static esp_err_t prepare_playable(const char *path, char *out_path, size_t out_len,
+                                  uint32_t *pcm_bytes) {
+    uint8_t magic[4] = {0};
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (fread(magic, 1, sizeof(magic), fp) != sizeof(magic)) {
+        memset(magic, 0, sizeof(magic));
+    }
+    fclose(fp);
+    if (memcmp(magic, "RIFF", 4) == 0) {
+        snprintf(out_path, out_len, "%s", path);
+        return ESP_OK;
+    }
+    if (memcmp(magic, "OggS", 4) == 0) {
+        uint32_t pcm = 0;
+        int64_t t0 = now_ms();
+        esp_err_t err = sonar_ogg_decode_to_wav(path, SONAR_PLAY_PCM_PATH, &pcm);
+        ESP_LOGI(TAG, "[t] Ogg 解码 %lld ms (%u 字节 PCM), %s", (long long)(now_ms() - t0),
+                 (unsigned)pcm, esp_err_to_name(err));
+        if (err != ESP_OK) {
+            return err;
+        }
+        if (pcm_bytes != NULL) {
+            *pcm_bytes = pcm;
+        }
+        snprintf(out_path, out_len, "%s", SONAR_PLAY_PCM_PATH);
+        return ESP_OK;
+    }
+    ESP_LOGW(TAG, "原声格式不支持: 首部 %02x %02x %02x %02x", magic[0], magic[1], magic[2],
+             magic[3]);
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
 static void poll_inbox_locked(void) {
     size_t count = 0;
     // 语音连接常驻会占着 ~15KB;若轮到 HTTP 时内存不够,先把语音连接让出来再试一次。
@@ -653,9 +691,20 @@ static void poll_inbox_locked(void) {
                 sonar_ack(&s_client, item->id, "failed", item->request_id);
                 continue;
             }
+            char play_path[sizeof(((play_req_t *)0)->path)] = {0};
+            uint32_t pcm = 0;
+            esp_err_t perr = prepare_playable(SONAR_PLAY_PATH, play_path, sizeof(play_path), &pcm);
+            if (perr != ESP_OK) {
+                // 解不了就是播不了:按合同回 failed,不能报 played。
+                ESP_LOGW(TAG, "原声无法播放(%s),回执 failed (delivery=%s)",
+                         esp_err_to_name(perr), item->id);
+                set_detail("answer format unsupported");
+                sonar_ack(&s_client, item->id, "failed", item->request_id);
+                continue;
+            }
             ESP_LOGI(TAG, "原声已下载 %u 字节,入队播放 (delivery=%s)", (unsigned)len, item->id);
             play_req_t req = {.is_mem = 0, .data = NULL, .len = 0};
-            snprintf(req.path, sizeof(req.path), "%s", SONAR_PLAY_PATH);
+            snprintf(req.path, sizeof(req.path), "%s", play_path);
             snprintf(req.ack_event, sizeof(req.ack_event), "%s", "played");
             snprintf(req.delivery_id, sizeof(req.delivery_id), "%s", item->id);
             snprintf(req.request_id, sizeof(req.request_id), "%s", item->request_id);
@@ -982,34 +1031,14 @@ static bool session_turn(const char *transcript) {
                 if (derr == ESP_OK) {
                     ESP_LOGI(TAG, "turn 原声 %u 字节 post=%s kind=%s", (unsigned)len,
                              item->post_id, item->kind);
-                    // 服务端按存储格式原样返回:历史素材是 RIFF/WAV,手机新录的是
-                    // Ogg Opus。播放链路只认 16 kHz PCM,所以 Ogg 要先解码成 WAV。
-                    uint8_t magic[4] = {0};
-                    FILE *mf = fopen(SONAR_PLAY_PATH, "rb");
-                    if (mf != NULL) {
-                        if (fread(magic, 1, sizeof(magic), mf) != sizeof(magic)) {
-                            memset(magic, 0, sizeof(magic));
-                        }
-                        fclose(mf);
-                    }
-                    const char *play_path = SONAR_PLAY_PATH;
-                    if (memcmp(magic, "OggS", 4) == 0) {
-                        uint32_t pcm = 0;
-                        int64_t td = now_ms();
-                        esp_err_t oerr =
-                            sonar_ogg_decode_to_wav(SONAR_PLAY_PATH, SONAR_PLAY_PCM_PATH, &pcm);
-                        ESP_LOGI(TAG, "[t] Ogg 解码 %lld ms (%u 字节 PCM)",
-                                 (long long)(now_ms() - td), (unsigned)pcm);
-                        if (oerr != ESP_OK) {
-                            // 合同要求:不能把"解不了"当成播放成功,不发 played。
-                            set_detail("answer format unsupported");
-                            set_phase(APP_PHASE_IDLE, "answer format unsupported");
-                            goto turn_done;
-                        }
-                        play_path = SONAR_PLAY_PCM_PATH;
-                    } else if (memcmp(magic, "RIFF", 4) != 0) {
-                        set_detail("answer format unknown");
-                        set_phase(APP_PHASE_IDLE, "answer format unknown");
+                    char play_path[sizeof(((play_req_t *)0)->path)] = {0};
+                    uint32_t pcm = 0;
+                    esp_err_t perr = prepare_playable(SONAR_PLAY_PATH, play_path,
+                                                      sizeof(play_path), &pcm);
+                    if (perr != ESP_OK) {
+                        // 合同要求:不能把"解不了"当成播放成功,不发 played。
+                        set_detail("answer format unsupported");
+                        set_phase(APP_PHASE_IDLE, "answer format unsupported");
                         goto turn_done;
                     }
                     play_req_t req = {.is_mem = 0, .data = NULL, .len = 0};
