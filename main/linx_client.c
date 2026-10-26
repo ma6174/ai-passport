@@ -13,7 +13,9 @@
 #include "esp_system.h"
 #include "linx_ca.h"
 #include "linx_ws.h"
+#include "sonar_store.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_mac.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -284,16 +286,24 @@ static esp_err_t ws_connect(const sonar_config_t *cfg, uint32_t timeout_ms) {
     // 握手失败常见两类:堆被切碎(TLS 要一块连续内存)、Wi-Fi 刚重连路由未就绪。
     // 都是瞬时的,退避重试 3 次再判定失败,别一次就报 ESP_FAIL 给用户。
     esp_err_t err = ESP_FAIL;
-    for (int attempt = 0; attempt < 3; attempt++) {
-        err = linx_ws_open(uri, headers, &WS_CALLBACKS, 4000);
+    for (int attempt = 0; attempt < 2; attempt++) {
+        // 验证链是 RSA 两级签发:C3 上完整握手实测要 4~6 秒,4 秒超时会稳定误判成
+        // "握手失败"再重试,反而把一次 5 秒的握手拖成 13 秒。给到 8 秒,靠预连接
+        // 把这段时间藏进用户说话的那几秒里。
+        int64_t hs_start = esp_timer_get_time();
+        err = linx_ws_open(uri, headers, &WS_CALLBACKS, 8000);
         if (err == ESP_OK) {
+            ESP_LOGI(TAG, "握手成功,耗时 %lld ms",
+                     (long long)((esp_timer_get_time() - hs_start) / 1000));
             break;
         }
-        progress("voice retry %d/3", attempt + 1);
-        ESP_LOGW(TAG, "WSS 连接失败(%d/3): %s,退避重试 (heap=%u 最大块=%u)",
+        ESP_LOGW(TAG, "握手失败,耗时 %lld ms",
+                 (long long)((esp_timer_get_time() - hs_start) / 1000));
+        progress("voice retry %d/2", attempt + 1);
+        ESP_LOGW(TAG, "WSS 连接失败(%d/2): %s,退避重试 (heap=%u 最大块=%u)",
                  attempt + 1, esp_err_to_name(err), (unsigned)esp_get_free_heap_size(),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-        if (attempt < 2) {
+        if (attempt < 1) {
             ws_teardown();
             vTaskDelay(pdMS_TO_TICKS(400 * (attempt + 1)));
         }
@@ -303,7 +313,7 @@ static esp_err_t ws_connect(const sonar_config_t *cfg, uint32_t timeout_ms) {
         // "证书校验"这种底层问题把整条语音链路卡死。
         ESP_LOGW(TAG, "严格校验握手失败,降级一次(不校验证书)重试");
         linx_ws_set_verify_relaxed(true);
-        err = linx_ws_open(uri, headers, &WS_CALLBACKS, 4000);
+        err = linx_ws_open(uri, headers, &WS_CALLBACKS, 8000);
         linx_ws_set_verify_relaxed(false);
         if (err != ESP_OK) {
             ws_teardown();
@@ -363,6 +373,7 @@ static esp_err_t stream_pcm(const char *wav_path) {
     uint8_t frame[640];
     uint32_t left = info.data_bytes;
     uint32_t frames = 0;
+    int64_t t_start = esp_timer_get_time();
     while (left > 0) {
         size_t want = left > sizeof(frame) ? sizeof(frame) : left;
         size_t n = fread(frame, 1, want, fp);
@@ -379,29 +390,72 @@ static esp_err_t stream_pcm(const char *wav_path) {
         }
         left -= (uint32_t)n;
         ++frames;
-        // 20 ms 一帧:与服务端 16 kHz/20 ms 的协商一致,突发灌入会被 VAD 丢掉。
+        // 录音已经结束,不必再按 20 ms 实时节奏发:服务端把收到的帧交给 ASR,
+        // 全速灌入能把"说完话到转写"的等待从(语音时长)压到(几十毫秒)。
         if (left > 0) {
-            vTaskDelay(pdMS_TO_TICKS(20));
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
     fclose(fp);
-    ESP_LOGI(TAG, "已发送 %u 帧(%u 字节 PCM)", (unsigned)frames, (unsigned)info.data_bytes);
+    ESP_LOGI(TAG, "已发送 %u 帧(%u 字节 PCM), 用时 %lld ms", (unsigned)frames,
+             (unsigned)info.data_bytes, (long long)((esp_timer_get_time() - t_start) / 1000));
     return ESP_OK;
 }
 
-static esp_err_t begin_listen(void) {
-    char msg[192];
+static bool s_listen_opus;
+
+static esp_err_t begin_listen(bool opus) {
+    char msg[320];
     int len;
+    // 上行音频格式在这里声明(hello 的 audio_params 描述的是下行,保持 PCM 不变)。
+    const char *params = opus ? ",\"audio_params\":{\"format\":\"opus\",\"sample_rate\":16000,"
+                                "\"channels\":1,\"frame_duration\":20}"
+                              : "";
+    s_listen_opus = opus;
     if (s_session_id[0] != '\0') {
         len = snprintf(msg, sizeof(msg),
                        "{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"start\","
-                       "\"mode\":\"manual\"}",
-                       s_session_id);
+                       "\"mode\":\"manual\"%s}",
+                       s_session_id, params);
     } else {
         len = snprintf(msg, sizeof(msg),
-                       "{\"type\":\"listen\",\"state\":\"start\",\"mode\":\"manual\"}");
+                       "{\"type\":\"listen\",\"state\":\"start\",\"mode\":\"manual\"%s}",
+                       params);
     }
     return ws_send_json(msg) == ESP_OK && len > 0 ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+}
+
+// 逐包发送 Opus(裸包流:2 字节小端长度 + 一帧),比 PCM 小一个数量级。
+static esp_err_t stream_opus(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    uint8_t head[2];
+    uint8_t packet[512];
+    uint32_t packets = 0;
+    while (fread(head, 1, sizeof(head), fp) == sizeof(head)) {
+        size_t len = (size_t)head[0] | ((size_t)head[1] << 8);
+        if (len == 0 || len > sizeof(packet)) {
+            ESP_LOGW(TAG, "Opus 包长度异常(%u),终止上行", (unsigned)len);
+            fclose(fp);
+            return ESP_ERR_INVALID_SIZE;
+        }
+        if (fread(packet, 1, len, fp) != len) {
+            break;
+        }
+        esp_err_t err = linx_ws_send_bin(packet, len);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "发送第 %u 个 Opus 包失败: %s", (unsigned)packets,
+                     esp_err_to_name(err));
+            fclose(fp);
+            return err;
+        }
+        packets++;
+    }
+    fclose(fp);
+    ESP_LOGI(TAG, "Opus 上行完成: %u 包", (unsigned)packets);
+    return ESP_OK;
 }
 
 static esp_err_t end_listen(void) {
@@ -433,8 +487,8 @@ esp_err_t linx_probe(const sonar_config_t *cfg) {
     return err;
 }
 
-static esp_err_t stt_once(const sonar_config_t *cfg, const char *wav_path, char *text,
-                          size_t text_len, uint32_t timeout_ms) {
+static esp_err_t stt_once(const sonar_config_t *cfg, const char *wav_path, bool use_opus,
+                          char *text, size_t text_len, uint32_t timeout_ms) {
     if (text == NULL || text_len == 0) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -456,10 +510,14 @@ static esp_err_t stt_once(const sonar_config_t *cfg, const char *wav_path, char 
     s_reply_len = 0;
     xEventGroupClearBits(s_events, BIT_STT | BIT_ERROR);
 
-    err = begin_listen();
+    err = begin_listen(use_opus);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "listen start 已发送");
-        err = stream_pcm(wav_path);
+        ESP_LOGI(TAG, "listen start 已发送(上行 %s)", use_opus ? "opus" : "pcm");
+        err = use_opus ? stream_opus(SONAR_OPUS_PATH) : stream_pcm(wav_path);
+        if (use_opus && err != ESP_OK) {
+            ESP_LOGW(TAG, "Opus 上行失败(%s),回退 PCM", esp_err_to_name(err));
+            err = stream_pcm(wav_path);
+        }
     }
     if (err == ESP_OK) {
         err = end_listen();
@@ -493,12 +551,24 @@ static esp_err_t stt_once(const sonar_config_t *cfg, const char *wav_path, char 
 
 esp_err_t linx_speech_to_text(const sonar_config_t *cfg, const char *wav_path, char *text,
                               size_t text_len, uint32_t timeout_ms) {
-    // 录音文件还在 SPIFFS 上,失败重发一次几乎不花成本;用户层面少一次"说完没反应"。
-    esp_err_t err = stt_once(cfg, wav_path, text, text_len, timeout_ms);
+    // 上行优先用 Opus(录音时已编码好),失败自动回退 PCM:
+    // 平台是否接受 opus 上行没法只靠文档确认,所以留一条确定能用的退路。
+    bool have_opus = sonar_store_file_size(SONAR_OPUS_PATH) > 0;
+    esp_err_t err = ESP_FAIL;
+    if (have_opus) {
+        err = stt_once(cfg, wav_path, true, text, text_len, timeout_ms);
+        if (err != ESP_OK || text[0] == '\0') {
+            ESP_LOGW(TAG, "Opus 上行未拿到转写(%s),回退 PCM 重试", esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(200));
+            err = stt_once(cfg, wav_path, false, text, text_len, timeout_ms);
+        }
+    } else {
+        err = stt_once(cfg, wav_path, false, text, text_len, timeout_ms);
+    }
     if (err != ESP_OK || text[0] == '\0') {
-        ESP_LOGW(TAG, "转写第一次失败(%s),重试一次", esp_err_to_name(err));
+        ESP_LOGW(TAG, "转写仍失败(%s),最后再试一次 PCM", esp_err_to_name(err));
         vTaskDelay(pdMS_TO_TICKS(300));
-        err = stt_once(cfg, wav_path, text, text_len, timeout_ms);
+        err = stt_once(cfg, wav_path, false, text, text_len, timeout_ms);
     }
     return err;
 }
@@ -543,9 +613,13 @@ esp_err_t linx_chat(const sonar_config_t *cfg, const char *wav_path, const char 
     }
     xEventGroupClearBits(s_events, BIT_TTS_DONE | BIT_ERROR);
 
-    err = begin_listen();
+    bool have_opus = sonar_store_file_size(SONAR_OPUS_PATH) > 0;
+    err = begin_listen(have_opus);
     if (err == ESP_OK) {
-        err = stream_pcm(wav_path);
+        err = have_opus ? stream_opus(SONAR_OPUS_PATH) : stream_pcm(wav_path);
+        if (have_opus && err != ESP_OK) {
+            err = stream_pcm(wav_path);
+        }
     }
     if (err == ESP_OK) {
         err = end_listen();

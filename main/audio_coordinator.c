@@ -12,6 +12,8 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "sonar_opus.h"
+#include "sonar_store.h"
 #include "sonar_wav.h"
 
 static const char *TAG = "audio";
@@ -75,6 +77,36 @@ static esp_err_t set_format(void) {
     return bsp_audio_set_format(SONAR_WAV_RATE, SONAR_WAV_BITS, SONAR_WAV_CHANNELS);
 }
 
+// 录音时顺手编 Opus:这样松手时包已经齐了,上行只传 ~20 KB 而不是 60 KB PCM。
+// 编码失败不影响录音本体(WAV 照写,PCM 上传仍可用)。
+static bool opus_begin(void) {
+    if (!SONAR_OPUS_UPLINK_ENABLED) {
+        return false;
+    }
+    if (sonar_opus_open() != ESP_OK) {
+        return false;
+    }
+    return true;
+}
+
+static bool opus_write_frame(FILE *fp, const int16_t *pcm) {
+    uint8_t packet[512];
+    int n = sonar_opus_encode(pcm, packet, sizeof(packet));
+    static bool logged;
+    if (!logged) {
+        logged = true;
+        ESP_LOGI(TAG, "Opus 首帧 %d 字节,本任务栈余量 %u 字节", n,
+                 (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
+    }
+    if (n <= 0) {
+        return false;
+    }
+    // 裸包流:2 字节小端长度 + 一个 Opus 帧(与仓库既有约定一致)
+    uint8_t head[2] = {(uint8_t)(n & 0xFF), (uint8_t)((n >> 8) & 0xFF)};
+    return fwrite(head, 1, sizeof(head), fp) == sizeof(head) &&
+           fwrite(packet, 1, (size_t)n, fp) == (size_t)n;
+}
+
 static void worker_record(const char *path) {
     uint8_t header[SONAR_WAV_HEADER_BYTES];
     sonar_wav_header(header, 0);
@@ -89,6 +121,14 @@ static void worker_record(const char *path) {
         s_record_truncated = true;
         return;
     }
+    FILE *ofp = fopen(SONAR_OPUS_PATH, "wb");
+    bool opus_ok = ofp != NULL && opus_begin();
+    if (!opus_ok && ofp != NULL) {
+        fclose(ofp);
+        ofp = NULL;
+    }
+    static int16_t accum[SONAR_OPUS_FRAME_SAMPLES];
+    size_t accum_len = 0;
     int16_t buf[REC_CHUNK_BYTES / 2];
     uint32_t pcm_bytes = 0;
     while (!s_stop_requested && pcm_bytes + sizeof(buf) <= SONAR_WAV_MAX_PCM_BYTES) {
@@ -101,6 +141,40 @@ static void worker_record(const char *path) {
             break;
         }
         pcm_bytes += sizeof(buf);
+        if (opus_ok) {
+            const int16_t *src = buf;
+            size_t left = sizeof(buf) / sizeof(buf[0]);
+            while (left > 0) {
+                size_t room = SONAR_OPUS_FRAME_SAMPLES - accum_len;
+                size_t take = left < room ? left : room;
+                memcpy(&accum[accum_len], src, take * sizeof(int16_t));
+                accum_len += take;
+                src += take;
+                left -= take;
+                if (accum_len == SONAR_OPUS_FRAME_SAMPLES) {
+                    if (!opus_write_frame(ofp, accum)) {
+                        ESP_LOGW(TAG, "写 Opus 包失败,改用 PCM 上行");
+                        opus_ok = false;
+                        break;
+                    }
+                    accum_len = 0;
+                }
+            }
+        }
+    }
+    if (opus_ok) {
+        if (accum_len > 0) {
+            memset(&accum[accum_len], 0, (SONAR_OPUS_FRAME_SAMPLES - accum_len) * sizeof(int16_t));
+            opus_ok = opus_write_frame(ofp, accum);
+        }
+        fclose(ofp);
+        ofp = NULL;
+        if (!opus_ok) {
+            sonar_store_remove(SONAR_OPUS_PATH);
+        }
+        // 编码器约 25 KB,只在录音期间需要:录完就还回去,给随后的 TLS 握手让位。
+        sonar_opus_close();
+        ESP_LOGI(TAG, "Opus 编码器已释放, heap=%u", (unsigned)esp_get_free_heap_size());
     }
     // 8 秒上限到顶仍继续说话时,标记截断并让上层提示;不静默裁掉。
     s_record_truncated = s_stop_requested ? false : (pcm_bytes >= SONAR_WAV_MAX_PCM_BYTES);
@@ -232,6 +306,10 @@ esp_err_t audio_init(void) {
     bsp_audio_set_volume(80);
     // play_path 局部缓冲 512 B + 1 KB,加上 I2S 驱动写入路径的栈开销,
     // 4 KB 在播放时会被打穿(实测栈保护重启)。
+    // 栈要够 Opus 编码:libopus 的 SILK/CELT 编码路径在栈上放不少临时缓冲,
+    // 6144 字节实测直接 "Stack protection fault"(崩在 audio 任务)。
+    // libopus 的 SILK 编码在栈上开整帧数组:12 KB 仍会越过栈边界(实测 SP 越过下界
+    // 约 1.2 KB),给到 20 KB;编码器本身另占 ~25 KB,录完立刻释放。
     if (xTaskCreate(worker_task, "audio", 6144, NULL, 6, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }

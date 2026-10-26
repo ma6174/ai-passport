@@ -1,2 +1,4 @@
 dependencies:
-  idf: ">=5.5.3,<5.6.0"
+  idf: '>=5.5.3,<5.6.0'
+  78/esp-opus-encoder: '*'
+  78/esp-opus: '^1.0.5'

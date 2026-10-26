@@ -19,6 +19,7 @@
 #include "local_secrets.h"
 #endif
 #include "esp_heap_caps.h"
+#include "esp_app_desc.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include <time.h>
@@ -131,6 +132,7 @@ static pending_publish_t s_pending_pub;
 static bool s_playing;
 static play_req_t s_current;
 static int64_t s_play_started_ms;
+static int64_t s_release_ms;    // 本轮松手时刻:端到端延迟的主指标起点
 
 static sonar_delivery_t s_inbox[SONAR_MAX_DELIVERIES];
 
@@ -365,6 +367,11 @@ static void start_next_playback(void) {
     }
     ESP_LOGI(TAG, "开始播放 %s -> %s", req.is_mem ? "内存素材" : req.path,
              esp_err_to_name(err));
+    if (err == ESP_OK && s_release_ms > 0 && !req.is_mem) {
+        // 主指标:用户有效语音结束 → 第一个可听回答(I2S 开始出声)
+        ESP_LOGI(TAG, "[t] 松手→首个可听帧 %lld ms", (long long)(now_ms() - s_release_ms));
+        s_release_ms = 0;
+    }
     if (err != ESP_OK) {
         if (req.path[0] != '\0') {
             sonar_store_remove(req.path);
@@ -1058,6 +1065,7 @@ static void stop_recording_and_process(void) {
                  truncated ? "(已截断)" : "", peak);
     }
     int64_t t_rec_stop = now_ms();
+    s_release_ms = t_rec_stop;
     set_phase(APP_PHASE_THINK, "transcribing");
     // TLS 握手要一块 5 KB 以上的连续内存,这里把可用堆和最大连续块记下来,
     // 握手失败时就能立刻判断是"内存不够"还是"证书/协议"问题。
@@ -1275,6 +1283,8 @@ static void app_task(void *arg) {
 
     app_ui_init();  // 先建状态页:没配置时也要有黑底画面,而不是面板白底
     // 弄清"它为什么重启":掉电/看门狗/panic 的处理方式完全不同。
+    ESP_LOGI(TAG, "固件 %s / IDF %s", esp_app_get_description()->version,
+             esp_app_get_description()->idf_ver);
     {
         esp_reset_reason_t rr = esp_reset_reason();
         const char *name = "unknown";

@@ -19,10 +19,13 @@ idf_component_register(
          "sonar_wav.c"
          "sonar_session.c"
          "sonar_text.c"
+         "sonar_opus.c"
          "font_cjk16.c"
     INCLUDE_DIRS "."
     REQUIRES bsp bt esp_event esp_hw_support esp_netif esp_timer esp_wifi nvs_flash
              esp_http_client esp-tls mbedtls json spiffs
              esp_app_format driver
+             # 直接调 libopus 的 C API(封装组件 78/esp-opus-encoder 只是 C++ 外壳)
+             78__esp-opus
     EMBED_FILES "assets/prompt.wav" "assets/beep.wav"
 )
