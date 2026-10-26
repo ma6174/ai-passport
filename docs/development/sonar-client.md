@@ -105,7 +105,8 @@ Three firmware rules follow:
    ~10 KB per session.
 
 The device displays whatever the `stt` channel returns: when the account quota is
-exhausted the server sends that notice as the transcript (observed: “额度不足，请联系灵矽商务”).
+exhausted the server sends that notice as the transcript (observed: a Chinese
+"quota exhausted, contact Linx sales" notice).
 
 ## Verification
 

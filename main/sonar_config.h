@@ -50,6 +50,9 @@ typedef struct {
 // 三个演示地点:模力社区、人工智能岛 19 号楼、中环线金科路路口。
 const sonar_place_preset_t *sonar_place_presets(size_t *count);
 
+// 把口语里听错的地名换成规范名(最左最长、最多一处);返回替换次数。
+size_t sonar_place_normalize(const char *in, char *out, size_t out_len);
+
 // 读取 NVS 配置。缺关键字段返回 ESP_ERR_NOT_FOUND(调用方应先播种)。
 esp_err_t sonar_config_load(sonar_config_t *out);
 

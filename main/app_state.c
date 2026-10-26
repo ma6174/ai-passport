@@ -1075,6 +1075,16 @@ static void stop_recording_and_process(void) {
     }
     int64_t t_stt = now_ms();
     ESP_LOGI(TAG, "转写: %s", s_transcript);
+    // 地名归一化:ASR 把「模力」写成「茉莉」时,服务端会地理编码到完全不同的 POI。
+    // 这里只替换**别名表里已知的**口语写法,不改动其他内容。
+    {
+        char normalized[SONAR_TEXT_MAX];
+        if (sonar_place_normalize(s_transcript, normalized, sizeof(normalized)) > 0 &&
+            strcmp(normalized, s_transcript) != 0) {
+            ESP_LOGW(TAG, "地名归一化: %s -> %s", s_transcript, normalized);
+            snprintf(s_transcript, sizeof(s_transcript), "%s", normalized);
+        }
+    }
     set_sticky("我说: %s", s_transcript);
     // 多轮会话优先:一句话 = 一个 utterance,由服务端决定私聊回答、发布提问还是配对闲聊。
     // 会话不可用(没地点/未建会话/传输失败)时才回退到单轮的 drafts/confirm 流程。

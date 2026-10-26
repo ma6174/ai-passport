@@ -70,6 +70,9 @@ static linx_ws_t s_ws = {.fd = -1};
 // ssl_prepare_record_content)。互斥不能只靠信号量——持锁任务被强制删除时会死锁,
 // 这里用一个原子标志做"进入即退出"的保护。
 static volatile bool s_busy;
+// 上一次握手超时的对端 IP。域名常解析到多个后端,其中某台偶尔不回 ServerHello;
+// 下次连接优先避开它,避免每次都要白等一个超时周期。
+static char s_bad_ip[16];
 
 static esp_err_t open_locked(const char *url, const char *headers, const linx_ws_callbacks_t *cb,
                              uint32_t timeout_ms);
@@ -550,13 +553,23 @@ static esp_err_t open_locked(const char *url, const char *headers, const linx_ws
         ESP_LOGE(TAG, "DNS 解析 %s 失败", host);
         return ESP_ERR_NOT_FOUND;
     }
-    {
+    // 优先选"上次没超时过"的地址;只有所有候选都一样坏才退回第一个。
+    struct addrinfo *pick = res;
+    for (struct addrinfo *it = res; it != NULL; it = it->ai_next) {
         char ip[16] = {0};
-        struct sockaddr_in *a = (struct sockaddr_in *)res->ai_addr;
-        snprintf(ip, sizeof(ip), "%s", inet_ntoa(a->sin_addr));
-        ESP_LOGI(TAG, "连接 %s:%d (%s)", host, port, ip);
+        snprintf(ip, sizeof(ip), "%s", inet_ntoa(((struct sockaddr_in *)it->ai_addr)->sin_addr));
+        if (s_bad_ip[0] != '\0' && strcmp(ip, s_bad_ip) == 0) {
+            continue;
+        }
+        pick = it;
+        break;
     }
-    int fd = socket(res->ai_family, res->ai_socktype, 0);
+    char peer_ip[16] = {0};
+    snprintf(peer_ip, sizeof(peer_ip), "%s",
+             inet_ntoa(((struct sockaddr_in *)pick->ai_addr)->sin_addr));
+    ESP_LOGI(TAG, "连接 %s:%d (%s)%s", host, port, peer_ip,
+             (s_bad_ip[0] != '\0' && strcmp(peer_ip, s_bad_ip) == 0) ? " [无可选备用地址]" : "");
+    int fd = socket(pick->ai_family, pick->ai_socktype, 0);
     if (fd < 0) {
         freeaddrinfo(res);
         return ESP_FAIL;
@@ -564,7 +577,7 @@ static esp_err_t open_locked(const char *url, const char *headers, const linx_ws
     struct timeval tv = {.tv_sec = (time_t)(timeout_ms / 1000), .tv_usec = 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+    if (connect(fd, pick->ai_addr, pick->ai_addrlen) != 0) {
         ESP_LOGE(TAG, "TCP 连接 %s:%d 失败", host, port);
         freeaddrinfo(res);
         close(fd);
@@ -665,7 +678,8 @@ static esp_err_t open_locked(const char *url, const char *headers, const linx_ws
             goto fail;
         }
         if (now_ms() >= deadline) {
-            ESP_LOGE(TAG, "TLS 握手超时");
+            ESP_LOGE(TAG, "TLS 握手超时(%s),下次优先换地址", peer_ip);
+            snprintf(s_bad_ip, sizeof(s_bad_ip), "%s", peer_ip);
             goto fail;
         }
         wait_fd(fd, ret == MBEDTLS_ERR_SSL_WANT_WRITE, 100);

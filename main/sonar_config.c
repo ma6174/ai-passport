@@ -1,6 +1,7 @@
 // main/sonar_config.c
 // 配置读写与演示地点表。
 #include "sonar_config.h"
+#include "sonar_text.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -24,7 +25,8 @@ static const sonar_place_preset_t PRESETS[] = {
     // 别名用 '|' 分隔。ASR 对「模力」的写法极不稳定,实测出现过
     // 魔力/摩力/膜力/文丽/我去/莫力,再加一个「社区」这种独有词兜底(三个点位里只有它带社区)。
     {"模力社区附近", "上海市浦东新区模力社区",
-     "模力社区|魔力社区|摩力社区|膜力社区|文丽社区|我去社区|莫力社区|磨力社区|社区|模力",
+     "模力社区|魔力社区|摩力社区|膜力社区|文丽社区|我去社区|莫力社区|磨力社区|茉莉社区|"
+     "木里社区|社区|模力|魔力|茉莉",
      "模力社区", 31.184698, 121.617324},
     {"人工智能岛19号楼附近", "上海市浦东新区川和路55弄19号",
      "人工智能岛|智能岛|19号楼|十九号楼|人工岛|岛|号楼", "人工智能岛", 31.184820,
@@ -33,6 +35,19 @@ static const sonar_place_preset_t PRESETS[] = {
      "金科路|华夏中路|中环线|金科|华夏路|路口", "交叉口", 31.173564, 121.602421},
 };
 #define PRESET_COUNT (sizeof(PRESETS) / sizeof(PRESETS[0]))
+
+// ASR 对地名的写法极不稳定(模力→魔力/茉莉/我去…)。发出去之前把**已知别名**
+// 换成规范名,服务端地理编码才不会跑到别的城市(实测「茉莉社区」被解成
+// 保利茉莉公馆/百旺·茉莉园,白多一轮反问)。
+// 只做"整词命中 + 最左最长"替换,最多一处;返回替换次数。
+size_t sonar_place_normalize(const char *in, char *out, size_t out_len) {
+    sonar_text_place_t places[PRESET_COUNT];
+    for (size_t i = 0; i < PRESET_COUNT; i++) {
+        places[i].label = PRESETS[i].label;
+        places[i].alias = PRESETS[i].alias;
+    }
+    return sonar_text_normalize_place(places, PRESET_COUNT, in, out, out_len);
+}
 
 const sonar_place_preset_t *sonar_place_presets(size_t *count) {
     if (count != NULL) {
