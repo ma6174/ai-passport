@@ -1,4 +1,6 @@
 # Name,   Type, SubType, Offset,   Size,     Flags
 nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,   0x1000,
-factory,  app,  factory, 0x10000,  0x7f0000,
+factory,  app,  factory, 0x10000,  0x400000,
+# 8 秒原声(256 KiB)与 TTS 回复都落在这里流式读写,不占内部 RAM。
+storage,  data, spiffs,  0x410000, 0x3f0000,

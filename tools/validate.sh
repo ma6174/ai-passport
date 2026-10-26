@@ -28,6 +28,17 @@ run_static_checks() {
         tests/test_ui_pixel_math.c main/ui_pixel_math.c \
         -o "${test_dir}/test_ui_pixel_math"
     "${test_dir}/test_ui_pixel_math"
+    for sonar in wav ogg uri time decision policy geo text; do
+        "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+            "tests/test_sonar_${sonar}.c" "main/sonar_${sonar}.c" \
+            -o "${test_dir}/test_sonar_${sonar}"
+        "${test_dir}/test_sonar_${sonar}"
+    done
+    # Ogg 封装需要 esp_err_t/ESP_LOGx,tests/audio_stubs 里就是这套平台桩头文件。
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain -Itests/audio_stubs \
+        tests/test_sonar_ogg_mux.c main/sonar_ogg_mux.c \
+        -o "${test_dir}/test_sonar_ogg_mux"
+    "${test_dir}/test_sonar_ogg_mux"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_demo_navigation.c main/demo_navigation.c \
         -o "${test_dir}/test_demo_navigation"
